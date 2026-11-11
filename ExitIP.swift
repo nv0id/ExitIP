@@ -1,6 +1,10 @@
 // ExitIP: menu bar app that shows your public IPv4 address,
 // green if it is a Mullvad exit IP, red if it is anything else.
 //
+// This branch adds orange: the exit is Mullvad, but traffic to
+// splitCheckHost (netflix.com) leaves by a different route, as it does
+// behind a router with domain based routing.
+//
 // The only network call is to Mullvad's own "am I Mullvad" check.
 // Build with ./build.sh (needs Xcode command line tools, macOS 13+).
 
@@ -13,6 +17,10 @@ import ServiceManagement
 private let endpoint = URL(string: "https://ipv4.am.i.mullvad.net/json")!
 private let refreshInterval: TimeInterval = 60   // seconds between routine checks
 private let settleDelay: UInt64 = 1_000_000_000  // wait 1s after a network change
+
+private let splitCheckHost = "netflix.com"            // the site that may bypass the VPN
+private let vpnReferenceHost = "ipv4.am.i.mullvad.net" // a site known to use the VPN
+private let traceHopLimit = 4                          // hops to look at, enough to see the split
 
 // MARK: - Model
 
@@ -31,10 +39,85 @@ struct ExitInfo: Decodable, Sendable {
     }
 }
 
+enum RouteVerdict: Sendable {
+    case viaVPN    // same way out as the VPN reference
+    case bypass    // leaves by a different route
+    case unknown   // a hop didn't answer, can't tell
+}
+
+struct RouteCheck: Sendable {
+    let verdict: RouteVerdict
+    let vpnPath: [String?]    // nil = hop didn't answer
+    let sitePath: [String?]
+}
+
 enum Reading: Sendable {
     case checking
-    case known(ExitInfo, Date)
+    case known(ExitInfo, RouteCheck?, Date)   // route is nil when the exit isn't Mullvad
     case failed(String, Date)
+}
+
+// MARK: - Route check
+
+// Runs the system traceroute and returns the first few hops.
+// One probe per hop, one second timeout, no DNS lookups on the hops.
+func traceHops(to host: String) -> [String?] {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/sbin/traceroute")
+    process.arguments = ["-n", "-q", "1", "-w", "1", "-m", String(traceHopLimit), host]
+    let out = Pipe()
+    process.standardOutput = out
+    process.standardError = FileHandle.nullDevice
+    do { try process.run() } catch { return [] }
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+
+    var hops: [String?] = []
+    for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
+        let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count >= 2, Int(parts[0]) != nil else { continue }
+        let hop: String? = parts[1] == "*" ? nil : String(parts[1])
+        hops.append(hop)
+    }
+    return hops
+}
+
+// RFC 1918 ranges plus carrier grade NAT (100.64.0.0/10, used by Starlink).
+func isPrivateAddress(_ ip: String) -> Bool {
+    let o = ip.split(separator: ".").compactMap { Int($0) }
+    guard o.count == 4 else { return false }
+    if o[0] == 10 { return true }
+    if o[0] == 172 && (16...31).contains(o[1]) { return true }
+    if o[0] == 192 && o[1] == 168 { return true }
+    if o[0] == 100 && (64...127).contains(o[1]) { return true }
+    return false
+}
+
+// Both routes start with private hops: your router, then either Mullvad's
+// tunnel gateway (10.x) or the ISP's gateway. If those opening hops match,
+// the two sites leave the same way. If they differ, the site is bypassing
+// the VPN. Hops further out are ignored because they vary by destination.
+func compareRoutes(vpn: [String?], site: [String?]) -> RouteVerdict {
+    if vpn.isEmpty || site.isEmpty { return .unknown }
+    for i in 0..<min(vpn.count, site.count) {
+        guard let a = vpn[i], let b = site[i] else {
+            if vpn[i] == nil && site[i] == nil { continue }
+            return .unknown
+        }
+        if !isPrivateAddress(a) && !isPrivateAddress(b) { return .viaVPN }
+        if a != b { return .bypass }
+    }
+    return .viaVPN
+}
+
+func checkRoute() -> RouteCheck {
+    let vpn = traceHops(to: vpnReferenceHost)
+    let site = traceHops(to: splitCheckHost)
+    return RouteCheck(verdict: compareRoutes(vpn: vpn, site: site), vpnPath: vpn, sitePath: site)
+}
+
+func describePath(_ hops: [String?]) -> String {
+    hops.isEmpty ? "no answer" : hops.map { $0 ?? "*" }.joined(separator: " → ")
 }
 
 // MARK: - App
@@ -117,7 +200,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let data = data,
                let http = response as? HTTPURLResponse, http.statusCode == 200,
                let info = try? JSONDecoder().decode(ExitInfo.self, from: data) {
-                result = .known(info, Date())
+                // Only trace when the exit is Mullvad. This runs off the main
+                // thread and takes a second or so.
+                let route = info.mullvadExitIP ? checkRoute() : nil
+                result = .known(info, route, Date())
             } else {
                 result = .failed(error?.localizedDescription ?? "Unexpected reply from Mullvad", Date())
             }
@@ -139,10 +225,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .checking:
             title = "● checking"
             color = .secondaryLabelColor
-        case .known(let info, _):
+        case .known(let info, let route, _):
             lastIP = info.ip
             title = "● " + info.ip
-            color = info.mullvadExitIP ? .systemGreen : .systemRed
+            if !info.mullvadExitIP {
+                color = .systemRed
+            } else if route?.verdict == .bypass {
+                color = .systemOrange
+            } else {
+                color = .systemGreen
+            }
         case .failed:
             // Couldn't check: show the last known address in grey, unconfirmed.
             title = "● " + (lastIP ?? "no reading")
@@ -174,7 +266,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch reading {
         case .checking:
             line("Checking…")
-        case .known(let info, let when):
+        case .known(let info, let route, let when):
             hasIP = true
             if info.mullvadExitIP {
                 line("Mullvad exit" + (info.mullvadHostname.map { " (\($0))" } ?? ""))
@@ -184,6 +276,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             line("Network: " + (info.organization ?? "unknown"))
             let place = [info.city, info.country].compactMap { $0 }.joined(separator: ", ")
             if !place.isEmpty { line("Location: " + place) }
+            if let route = route {
+                menu.addItem(.separator())
+                switch route.verdict {
+                case .viaVPN:  line(splitCheckHost + ": through the VPN")
+                case .bypass:  line(splitCheckHost + ": bypassing the VPN")
+                case .unknown: line(splitCheckHost + ": route unclear")
+                }
+                line("VPN route: " + describePath(route.vpnPath))
+                line(splitCheckHost + " route: " + describePath(route.sitePath))
+                menu.addItem(.separator())
+            }
             line("Checked " + timeFormatter.string(from: when))
         case .failed(let reason, let when):
             line("Couldn't check: " + reason)
@@ -209,7 +312,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Actions
 
     @objc private func copyIP() {
-        guard case .known(let info, _) = reading else { return }
+        guard case .known(let info, _, _) = reading else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(info.ip, forType: .string)
     }
