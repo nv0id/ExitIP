@@ -12,7 +12,7 @@ import ServiceManagement
 
 private let endpoint = URL(string: "https://ipv4.am.i.mullvad.net/json")!
 private let refreshInterval: TimeInterval = 60   // seconds between routine checks
-private let settleDelay: UInt64 = 2_000_000_000  // wait 2s after a network change
+private let settleDelay: UInt64 = 1_000_000_000  // wait 1s after a network change
 
 // MARK: - Model
 
@@ -47,6 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settleTask: Task<Void, Never>?
     private var generation = 0
     private var reading: Reading = .checking
+    private var lastIP: String?
 
     private let timeFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -78,12 +79,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         check()
     }
 
-    // The old answer can't be trusted once the network changes, so go grey
-    // straight away, let things settle, then ask again.
+    // On a network change, keep showing the last reading and re-check quietly
+    // once things settle. The display only changes when the new answer (or a
+    // failure) comes back.
     private func networkChanged() {
         generation += 1          // drop any reply still in flight
-        reading = .checking
-        render()
         settleTask?.cancel()
         settleTask = Task {
             try? await Task.sleep(nanoseconds: settleDelay)
@@ -140,10 +140,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             title = "● checking"
             color = .secondaryLabelColor
         case .known(let info, _):
+            lastIP = info.ip
             title = "● " + info.ip
             color = info.mullvadExitIP ? .systemGreen : .systemRed
         case .failed:
-            title = "● no reading"
+            // Couldn't check: show the last known address in grey, unconfirmed.
+            title = "● " + (lastIP ?? "no reading")
             color = .secondaryLabelColor
         }
         statusItem.button?.attributedTitle = NSAttributedString(string: title, attributes: [
@@ -185,6 +187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             line("Checked " + timeFormatter.string(from: when))
         case .failed(let reason, let when):
             line("Couldn't check: " + reason)
+            if let ip = lastIP { line("Last known address: " + ip + " (unconfirmed)") }
             line("Tried " + timeFormatter.string(from: when))
         }
 
